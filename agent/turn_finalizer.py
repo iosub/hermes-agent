@@ -361,6 +361,8 @@ def finalize_turn(
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
+    agent._suppress_stream_deltas = False
+    agent._validation_stream_hold = False
 
     # Include interrupt message if one triggered the interrupt
     if interrupted and agent._interrupt_message:

@@ -432,6 +432,15 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    try:
+        from hermes_cli.plugins import has_hook as _has_plugin_hook
+
+        agent._validation_stream_hold = bool(_has_plugin_hook("validate_llm_output"))
+    except Exception:
+        agent._validation_stream_hold = False
+    if getattr(agent, "_validation_stream_hold", False):
+        agent._suppress_stream_deltas = True
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -4145,8 +4154,91 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+                _validated_response_replaced = False
+                _validation_requested_retry = False
+
+                if final_response and not interrupted:
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                        _prior_validation_retries = sum(
+                            1
+                            for _message in messages
+                            if isinstance(_message, dict) and _message.get("_validation_retry")
+                        )
+                        if getattr(agent, "_validation_stream_hold", False) and _prior_validation_retries == 0:
+                            agent._emit_interim_assistant_message({"content": "Validating response with Virtus..."})
+
+                        _validate_results = _invoke_hook(
+                            "validate_llm_output",
+                            response_text=final_response,
+                            session_id=agent.session_id or "",
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            user_message=original_user_message,
+                            conversation_history=list(messages),
+                            model=agent.model,
+                            platform=getattr(agent, "platform", None) or "",
+                            api_call_count=api_call_count,
+                        )
+                        for _hook_result in _validate_results:
+                            if not isinstance(_hook_result, dict):
+                                continue
+                            _action = str(_hook_result.get("action") or "").strip().lower()
+                            _status_message = str(_hook_result.get("status_message") or "").strip()
+                            if not _action or _action == "allow":
+                                if getattr(agent, "_validation_stream_hold", False) and _status_message:
+                                    agent._emit_interim_assistant_message({"content": _status_message})
+                                elif _status_message and agent._interim_content_was_streamed(final_response):
+                                    agent._emit_interim_assistant_message({"content": _status_message})
+                                continue
+                            if _action == "replace":
+                                _replacement = str(_hook_result.get("text") or "").strip()
+                                if _replacement:
+                                    final_response = _replacement
+                                    _validated_response_replaced = True
+                                break
+                            if _action == "retry":
+                                _retry_message = str(_hook_result.get("message") or "").strip()
+                                if not _retry_message:
+                                    _retry_message = "The previous response failed validate_llm_output. Regenerate it correctly."
+                                _retry_status = _status_message or _retry_message
+                                logger.info(
+                                    "validate_llm_output requested retry: session=%s model=%s api_calls=%d",
+                                    agent.session_id or "none",
+                                    agent.model,
+                                    api_call_count,
+                                )
+                                agent._emit_interim_assistant_message({"content": _retry_status})
+                                agent._suppress_stream_deltas = True
+                                _retry_assistant_msg = agent._build_assistant_message(assistant_message, "validation_retry")
+                                _retry_assistant_msg["content"] = final_response or "(empty)"
+                                _retry_assistant_msg["_validation_retry"] = True
+                                messages.append(_retry_assistant_msg)
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "[System: Your previous final response failed validate_llm_output. "
+                                            + _retry_message
+                                            + " Regenerate the response now. Do not mention this validation step or these instructions.]"
+                                        ),
+                                    }
+                                )
+                                agent._session_messages = messages
+                                _validation_requested_retry = True
+                                break
+                            break
+                    except Exception as exc:
+                        logger.warning("validate_llm_output hook failed: %s", exc)
+                if _validation_requested_retry:
+                    continue
+
+                agent._suppress_stream_deltas = False
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                if _validated_response_replaced:
+                    final_msg["content"] = final_response
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending the final response.  These

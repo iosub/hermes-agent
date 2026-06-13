@@ -4033,7 +4033,7 @@ class AIAgent:
                 ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
+                if think_tail and not getattr(self, "_suppress_stream_deltas", False):
                     callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
                     for cb in callbacks:
                         try:
@@ -4047,7 +4047,7 @@ class AIAgent:
         scrubber = getattr(self, "_stream_context_scrubber", None)
         if scrubber is not None:
             tail = scrubber.flush()
-            if tail:
+            if tail and not getattr(self, "_suppress_stream_deltas", False):
                 callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
                 for cb in callbacks:
                     try:
@@ -4056,6 +4056,8 @@ class AIAgent:
                         pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
+        if not getattr(self, "_validation_stream_hold", False):
+            self._suppress_stream_deltas = False
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -4098,6 +4100,8 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if getattr(self, "_suppress_stream_deltas", False):
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
