@@ -1230,12 +1230,7 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
         root = _ensure_managed_root(raw_forced_root) if create_root else _canonical_path(Path(raw_forced_root))
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
-    # Remote/OAuth access does not imply a hosted container. Users can expose a
-    # local dashboard through the auth gate (for example a macOS launchd install)
-    # and still expect the Files page to browse their local home directory. Lock
-    # to /opt/data only when the installation's Hermes root is actually /opt/data
-    # (the container/hosted layout) or when HERMES_DASHBOARD_FILES_ROOT is set.
-    if _default_hermes_root_is_opt_data():
+    if not _local_dashboard_request(request) or _default_hermes_root_is_opt_data():
         root = _ensure_managed_root(_HOSTED_MANAGED_FILES_ROOT) if create_root else _HOSTED_MANAGED_FILES_ROOT
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
@@ -1645,16 +1640,17 @@ async def get_status():
         # Module not importable yet (early startup) — leave as [].
         pass
 
-    # Always-public liveness + auth-gate shape. Safe for external uptime
-    # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
-    # bootstrap, and anyone who can curl the host — i.e. exactly the audience
-    # ``PUBLIC_API_PATHS`` documents this endpoint as serving.
-    status = {
+    return {
         "version": __version__,
         "release_date": __release_date__,
+        "hermes_home": str(get_hermes_home()),
+        "config_path": str(get_config_path()),
+        "env_path": str(get_env_path()),
         "config_version": current_ver,
         "latest_config_version": latest_ver,
         "gateway_running": gateway_running,
+        "gateway_pid": gateway_pid,
+        "gateway_health_url": _GATEWAY_HEALTH_URL,
         "gateway_state": gateway_state,
         "gateway_platforms": gateway_platforms,
         "gateway_exit_reason": gateway_exit_reason,
@@ -1663,27 +1659,6 @@ async def get_status():
         "auth_required": auth_required,
         "auth_providers": auth_providers,
     }
-
-    # Absolute host paths, the gateway PID, and the internal gateway health
-    # URL are deployment recon a liveness probe never needs. ``/api/status``
-    # is in ``PUBLIC_API_PATHS`` so it bypasses dashboard auth; on a
-    # network-exposed (gated) bind that means *any* unauthenticated caller
-    # reaches it, and leaking host metadata there contradicts the allowlist's
-    # own contract ("version, gateway state, active session count, and the
-    # dashboard auth-gate shape. No bodies, no session content, no secrets").
-    # Surface this detail only on a loopback / ``--insecure`` bind, where the
-    # dashboard is local-only and the caller is already inside the trust
-    # envelope — the same loopback/gated split ``should_require_auth`` draws.
-    if not auth_required:
-        status.update({
-            "hermes_home": str(get_hermes_home()),
-            "config_path": str(get_config_path()),
-            "env_path": str(get_env_path()),
-            "gateway_pid": gateway_pid,
-            "gateway_health_url": _GATEWAY_HEALTH_URL,
-        })
-
-    return status
 
 
 _WINDOWS_11_MIN_BUILD = 22000
@@ -2584,9 +2559,6 @@ async def get_sessions(
             status_code=400,
             detail="order must be one of: created, recent",
         )
-    profile_name: Optional[str] = None
-    if profile:
-        profile_name, _ = _cron_profile_home(profile)
     try:
         db = _open_session_db_for_profile(profile)
         try:
@@ -2622,16 +2594,11 @@ async def get_sessions(
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
-                if profile_name:
-                    s["profile"] = profile_name
-                    s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
-    except HTTPException:
-        raise
     except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -2913,8 +2880,6 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
             return {"results": list(seen.values())}
         finally:
             db.close()
-    except HTTPException:
-        raise
     except Exception:
         _log.exception("GET /api/sessions/search failed")
         raise HTTPException(status_code=500, detail="Search failed")
@@ -3856,9 +3821,9 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         ),
     },
     "weixin": {
-        "name": "Weixin / WeChat (Personal)",
-        "description": "Connect a personal WeChat account through Tencent's iLink Bot API.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/weixin/",
+        "name": "WeChat (Official Account)",
+        "description": "Connect a WeChat Official Account.",
+        "docs_url": "https://developers.weixin.qq.com/doc/offiaccount/Getting_Started/Overview.html",
         "env_vars": ("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN", "WEIXIN_BASE_URL"),
         "required_env": ("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN"),
     },
@@ -4029,17 +3994,17 @@ _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
         "password": True,
     },
     "WEIXIN_ACCOUNT_ID": {
-        "description": "iLink Bot account ID obtained through QR login in hermes gateway setup",
-        "prompt": "iLink Bot account ID",
+        "description": "WeChat Official Account ID",
+        "prompt": "Account ID",
     },
     "WEIXIN_TOKEN": {
-        "description": "iLink Bot token obtained through QR login in hermes gateway setup",
-        "prompt": "iLink Bot token",
+        "description": "WeChat callback token",
+        "prompt": "Token",
         "password": True,
     },
     "WEIXIN_BASE_URL": {
-        "description": "iLink API base URL saved by QR login (default: https://ilinkai.weixin.qq.com)",
-        "prompt": "iLink API base URL",
+        "description": "WeChat platform base URL",
+        "prompt": "Base URL",
     },
     "FEISHU_APP_ID": {"description": "Feishu / Lark app ID", "prompt": "App ID"},
     "FEISHU_APP_SECRET": {
@@ -5134,15 +5099,6 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
     return {"logged_in": False}
 
 
-def _oauth_provider_disconnect_hint(provider: Dict[str, Any], status: Dict[str, Any]) -> Optional[str]:
-    """Return the manual disconnect path when the API cannot clear this provider."""
-    if provider.get("flow") == "external":
-        return f"Use `{provider['cli_command']}` or that provider's CLI to remove it."
-    if status.get("source") == "env_var":
-        return "Remove the API key from Settings → Keys instead."
-    return None
-
-
 @app.get("/api/providers/oauth")
 async def list_oauth_providers():
     """Enumerate every OAuth-capable LLM provider with current status.
@@ -5164,15 +5120,12 @@ async def list_oauth_providers():
     providers = []
     for p in _OAUTH_PROVIDER_CATALOG:
         status = _resolve_provider_status(p["id"], p.get("status_fn"))
-        disconnect_hint = _oauth_provider_disconnect_hint(p, status)
         providers.append({
             "id": p["id"],
             "name": p["name"],
             "flow": p["flow"],
             "cli_command": p["cli_command"],
             "docs_url": p["docs_url"],
-            "disconnect_hint": disconnect_hint,
-            "disconnectable": disconnect_hint is None,
             "status": status,
         })
     return {"providers": providers}
@@ -5183,56 +5136,37 @@ async def disconnect_oauth_provider(provider_id: str, request: Request):
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
     _require_token(request)
 
-    catalog_by_id = {p["id"]: p for p in _OAUTH_PROVIDER_CATALOG}
-    provider = catalog_by_id.get(provider_id)
-    if provider is None:
+    valid_ids = {p["id"] for p in _OAUTH_PROVIDER_CATALOG}
+    if provider_id not in valid_ids:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown provider: {provider_id}. "
-                   f"Available: {', '.join(sorted(catalog_by_id))}",
+                   f"Available: {', '.join(sorted(valid_ids))}",
         )
 
-    disconnect_hint = _oauth_provider_disconnect_hint(provider, {})
-    if disconnect_hint:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{provider['name']} cannot be disconnected automatically. {disconnect_hint}",
-        )
-
-    status = _resolve_provider_status(provider_id, provider.get("status_fn"))
-    disconnect_hint = _oauth_provider_disconnect_hint(provider, status)
-    if disconnect_hint:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{provider['name']} cannot be disconnected automatically. {disconnect_hint}",
-        )
-
-    # Anthropic clears only the Hermes-managed PKCE file and auth-store entry.
-    # The separate claude-code catalog row is external/read-only and rejected
-    # above so we never pretend to remove ~/.claude/* credentials owned by the CLI.
-    if provider_id == "anthropic":
-        cleared = False
+    # Anthropic and claude-code clear the same Hermes-managed PKCE file
+    # AND forget the Claude Code import. We don't touch ~/.claude/* directly
+    # — that's owned by the Claude Code CLI; users can re-auth there if they
+    # want to undo a disconnect.
+    if provider_id in {"anthropic", "claude-code"}:
         try:
             from agent.anthropic_adapter import _HERMES_OAUTH_FILE
             if _HERMES_OAUTH_FILE.exists():
                 _HERMES_OAUTH_FILE.unlink()
-                cleared = True
         except Exception:
             pass
         # Also clear the credential pool entry if present.
         try:
             from hermes_cli.auth import clear_provider_auth
-            cleared = clear_provider_auth("anthropic") or cleared
+            clear_provider_auth("anthropic")
         except Exception:
             pass
         _log.info("oauth/disconnect: %s", provider_id)
-        return {"ok": bool(cleared), "provider": provider_id}
+        return {"ok": True, "provider": provider_id}
 
     try:
-        from hermes_cli.auth import clear_provider_auth, invalidate_nous_auth_status_cache
+        from hermes_cli.auth import clear_provider_auth
         cleared = clear_provider_auth(provider_id)
-        if provider_id == "nous":
-            invalidate_nous_auth_status_cache()
         _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
         return {"ok": bool(cleared), "provider": provider_id}
     except Exception as e:
@@ -6266,27 +6200,25 @@ async def cancel_oauth_session(session_id: str, request: Request):
 
 
 
-def _session_latest_descendant(session_id: str):
+def _session_latest_descendant(session_id: str, profile: Optional[str] = None):
     """Resolve a session id to the newest child leaf session.
 
     /model may create child sessions. Dashboard refresh should continue the
     newest child instead of reopening the old parent.
     """
-    from hermes_state import SessionDB
-
-    def row_get(row, key, index):
-        if isinstance(row, dict):
-            return row.get(key)
-        try:
-            return row[key]
-        except Exception:
-            try:
-                return row[index]
-            except Exception:
-                return None
-
-    db = SessionDB()
+    db = _open_session_db_for_profile(profile)
     try:
+
+        def row_get(row, key, index):
+            if isinstance(row, dict):
+                return row.get(key)
+            try:
+                return row[key]
+            except Exception:
+                try:
+                    return row[index]
+                except Exception:
+                    return None
         sid = db.resolve_session_id(session_id)
         if not sid or not db.get_session(sid):
             return None, []
@@ -6355,11 +6287,13 @@ def _session_latest_descendant(session_id: str):
 # reorder this block, move every route in it together.
 class BulkDeleteSessions(BaseModel):
     ids: List[str]
-    profile: Optional[str] = None
 
 
 @app.post("/api/sessions/bulk-delete")
-async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
+async def bulk_delete_sessions_endpoint(
+    body: BulkDeleteSessions,
+    profile: Optional[str] = None,
+):
     """Delete every session in ``body.ids`` in a single DB transaction.
 
     Backs the dashboard's bulk-select-and-delete flow on the sessions
@@ -6400,7 +6334,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(profile)
     try:
         deleted = db.delete_sessions(body.ids)
         return {"ok": True, "deleted": deleted}
@@ -6482,7 +6416,10 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
+def _open_session_db_for_profile(
+    profile: Optional[str],
+    home: Optional[Path] = None,
+):
     """Open a SessionDB for read paths, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
@@ -6491,22 +6428,29 @@ def _open_session_db_for_profile(profile: Optional[str]):
     (transcripts, detail) without spawning that profile's backend.
     """
     from hermes_state import SessionDB
+
     if not profile:
         return SessionDB()
-    _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+
+    resolved_home = home if home is not None else _cron_profile_home(profile)[1]
+    return SessionDB(db_path=resolved_home / "state.db")
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
+    resolved_name = None
+    resolved_home = None
+    if profile:
+        resolved_name, resolved_home = _cron_profile_home(profile)
+
+    db = _open_session_db_for_profile(profile, resolved_home)
     try:
         sid = db.resolve_session_id(session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
+        if resolved_name:
+            session["profile"] = resolved_name
         return session
     finally:
         db.close()
@@ -6514,8 +6458,11 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
-    latest, path = _session_latest_descendant(session_id)
+async def get_session_latest_descendant(
+    session_id: str,
+    profile: Optional[str] = None,
+):
+    latest, path = _session_latest_descendant(session_id, profile=profile)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
@@ -6562,14 +6509,18 @@ class SessionRename(BaseModel):
 
 
 @app.patch("/api/sessions/{session_id}")
-async def rename_session_endpoint(session_id: str, body: SessionRename):
+async def rename_session_endpoint(
+    session_id: str,
+    body: SessionRename,
+    profile: Optional[str] = None,
+):
     """Update a session: rename (or clear its title) and/or archive it.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
     restores the session. Either field may be omitted. ``profile`` targets
     another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile or profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
@@ -6614,18 +6565,25 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 class SessionPrune(BaseModel):
     older_than_days: int = 90
     source: Optional[str] = None
-    profile: Optional[str] = None
 
 
 @app.post("/api/sessions/prune")
-async def prune_sessions_endpoint(body: SessionPrune):
+async def prune_sessions_endpoint(
+    body: SessionPrune,
+    profile: Optional[str] = None,
+):
     """Delete ended sessions older than N days (mirrors `hermes sessions prune`)."""
     if body.older_than_days < 1:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
-    profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
+
+    resolved_name = None
+    resolved_home = get_hermes_home()
+    if profile:
+        resolved_name, resolved_home = _cron_profile_home(profile)
+
+    db = _open_session_db_for_profile(profile, resolved_home)
     try:
-        sessions_dir = profile_home / "sessions"
+        sessions_dir = resolved_home / "sessions"
         removed = db.prune_sessions(
             older_than_days=body.older_than_days,
             source=(body.source or None),
@@ -7134,11 +7092,7 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
 
     try:
         with _profile_scope(body.profile or profile):
-            if not _save_mcp_server(name, server_config):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Server '{name}' rejected: suspicious command/args configuration",
-                )
+            _save_mcp_server(name, server_config)
     except HTTPException:
         raise
     except Exception as exc:
@@ -8553,13 +8507,15 @@ async def scan_skill_hub(identifier: str = ""):
 
 class ProfileCreate(BaseModel):
     name: str
-    clone_from: Optional[str] = None
-    # Backward compatibility for older dashboard/desktop clients. New clients
-    # send clone_from="default" (or another profile name) explicitly.
     clone_from_default: bool = False
     clone_all: bool = False
     no_skills: bool = False
     description: Optional[str] = None
+    # Explicit source profile to clone from (e.g. duplicating an existing
+    # profile). When set, it takes precedence over ``clone_from_default``,
+    # which always sources from "default". ``clone_all`` still selects a full
+    # state copytree vs. a config/skills/SOUL copy.
+    clone_from: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     # Profile-builder additions — all optional, all applied best-effort AFTER
@@ -8736,7 +8692,6 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
     Returns the number of servers written.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from hermes_cli.mcp_security import validate_mcp_server_entry
 
     written = 0
     token = set_hermes_home_override(str(profile_dir))
@@ -8761,10 +8716,6 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
             if not entry:
                 # Nothing usable to write (neither url nor command) — skip
                 # rather than persist an empty, unusable server stanza.
-                continue
-            issues = validate_mcp_server_entry(name, entry)
-            if issues:
-                _log.warning("Profile-create: skipping MCP server '%s': %s", name, "; ".join(issues))
                 continue
             mcp[name] = entry
             written += 1
@@ -8836,16 +8787,10 @@ async def create_profile_endpoint(body: ProfileCreate):
         clone = True
         clone_from = explicit_source
         clone_config = not body.clone_all
-    elif body.clone_all:
-        # Preserve the dashboard's historical clone-all behavior: a full-copy
-        # request with no explicit dropdown source copies from default.
-        clone = True
-        clone_from = "default"
-        clone_config = False
     else:
-        clone = body.clone_from_default
+        clone = body.clone_from_default or body.clone_all
         clone_from = "default" if clone else None
-        clone_config = clone
+        clone_config = body.clone_from_default and not body.clone_all
     try:
         path = profiles_mod.create_profile(
             name=body.name,
@@ -9684,10 +9629,11 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 
 
 @app.get("/api/analytics/usage")
-async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
+async def get_usage_analytics(days: int = 30):
+    from hermes_state import SessionDB
     from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
+    db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
@@ -9752,13 +9698,15 @@ async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
 
 
 @app.get("/api/analytics/models")
-async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
+async def get_models_analytics(days: int = 30):
     """Rich per-model analytics for the Models dashboard page.
 
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
+    from hermes_state import SessionDB
+
+    db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
 
@@ -9780,71 +9728,7 @@ async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
             GROUP BY model, billing_provider
             ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
         """, (cutoff,))
-        raw_rows = [dict(r) for r in cur.fetchall()]
-
-        # Session rows can be created before the first billable provider call
-        # finishes. If that early row records only the model name, and a later
-        # row for the same model has real accounting + billing_provider, the
-        # Models page used to show a duplicate "0 tokens / — API calls" card
-        # next to the real provider card. Fold those session-only rows into
-        # the single accounted provider row when the ownership is unambiguous.
-        rows_by_model: Dict[str, List[Dict[str, Any]]] = {}
-        for row in raw_rows:
-            rows_by_model.setdefault(row.get("model") or "", []).append(row)
-
-        rows: List[Dict[str, Any]] = []
-        for model_rows in rows_by_model.values():
-            provider_rows = [r for r in model_rows if r.get("billing_provider")]
-            if len(provider_rows) == 1:
-                target = provider_rows[0]
-                for row in model_rows:
-                    if row is target or row.get("billing_provider"):
-                        continue
-                    has_usage = any(
-                        (row.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
-                        )
-                    )
-                    if has_usage:
-                        continue
-                    target["sessions"] = (target.get("sessions") or 0) + (row.get("sessions") or 0)
-                    target["last_used_at"] = max(target.get("last_used_at") or 0, row.get("last_used_at") or 0)
-                    total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
-                    sessions = target.get("sessions") or 0
-                    target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
-                rows.append(target)
-                rows.extend(
-                    r for r in model_rows
-                    if r is not target
-                    and (r.get("billing_provider") or any(
-                        (r.get(key) or 0) != 0
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_read_tokens",
-                            "reasoning_tokens",
-                            "estimated_cost",
-                            "actual_cost",
-                            "api_calls",
-                            "tool_calls",
-                        )
-                    ))
-                )
-            else:
-                rows.extend(model_rows)
-
-        rows.sort(
-            key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
-            reverse=True,
-        )
+        rows = [dict(r) for r in cur.fetchall()]
 
         models = []
         for row in rows:
@@ -10665,7 +10549,7 @@ def mount_spa(application: FastAPI):
         ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
         auth scheme for /api/pty and /api/ws (ticket vs token).
         """
-        html = _index_path.read_text(encoding="utf-8")
+        html = _index_path.read_text()
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
@@ -10715,7 +10599,7 @@ def mount_spa(application: FastAPI):
         ):
             return JSONResponse({"error": "not found"}, status_code=404)
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
-        css = css_path.read_text(encoding="utf-8")
+        css = css_path.read_text()
         if prefix:
             for asset_dir in ("/fonts/", "/fonts-terminal/", "/ds-assets/", "/assets/"):
                 css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
