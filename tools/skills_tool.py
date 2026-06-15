@@ -596,13 +596,17 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(*, skip_disabled: bool = False, skills_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``hermes skills`` config UI). Default False
             filters out disabled skills.
+        skills_dir: Optional override for the skills directory. When provided,
+            scans this directory instead of the module-level SKILLS_DIR. Used
+            by the web server to serve skills for a specific profile via
+            ?profile= query parameter.
 
     Returns:
         List of skill metadata dicts (name, description, category).
@@ -617,8 +621,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     # Scan local dir first, then external dirs (local takes precedence)
     dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
+    target_skills_dir = skills_dir if skills_dir is not None else SKILLS_DIR
+    if target_skills_dir.exists():
+        dirs_to_scan.append(target_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
     for scan_dir in dirs_to_scan:
